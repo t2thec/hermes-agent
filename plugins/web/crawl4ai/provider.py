@@ -400,7 +400,9 @@ class Crawl4AIWebSearchProvider(WebSearchProvider):
     def is_available(self) -> bool:
         """Return True when the core deps (httpx + trafilatura) are importable.
 
-        crawl4ai (Playwright) is optional — the fast path works without it.
+        The ``ddgs`` package is optional — if installed, search uses it
+        (better CAPTCHA handling); otherwise falls back to raw DDG HTML
+        scraping. The extract path (httpx + trafilatura) is always required.
         """
         return _check_httpx() and _check_trafilatura()
 
@@ -417,27 +419,66 @@ class Crawl4AIWebSearchProvider(WebSearchProvider):
         return {
             "name": self.display_name,
             "badge": "free",
-            "tag": "No API key required — self-hosted. Uses httpx + trafilatura for static pages and Crawl4AI/Playwright for JS-rendered content.",
+            "tag": "No API key required — self-hosted. Uses ddgs package for search (install with pip install ddgs) and httpx + trafilatura for extraction.",
             "env_vars": [],
         }
 
     # --- Search ----------------------------------------------------------------
 
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
-        """Search via DuckDuckGo HTML scraping."""
+        """Search via DuckDuckGo. Uses the ``ddgs`` package if installed
+        (handles CAPTCHAs and session management internally), otherwise
+        falls back to raw HTML scraping of DDG's HTML endpoint.
+        """
         from tools.interrupt import is_interrupted
 
         if is_interrupted():
             return {"success": False, "error": "Interrupted"}
 
         logger.info("Crawl4AI search: '%s' (limit=%d)", query, limit)
-        results = _ddg_html_search(query, limit)
 
+        # Prefer ddgs package — it handles DDG's anti-bot internally
+        results = self._search_via_ddgs(query, limit)
+        if results is not None:
+            if not results:
+                return {"success": False, "error": "No search results found"}
+            logger.info("Crawl4AI: found %d search results (via ddgs package)", len(results))
+            return {"success": True, "data": {"web": results}}
+
+        # Fallback: raw DDG HTML scraping (less reliable, gets CAPTCHA'd)
+        results = _ddg_html_search(query, limit)
         if not results:
             return {"success": False, "error": "No search results found"}
 
-        logger.info("Crawl4AI: found %d search results", len(results))
+        logger.info("Crawl4AI: found %d search results (via DDG HTML scrape)", len(results))
         return {"success": True, "data": {"web": results}}
+
+    def _search_via_ddgs(self, query: str, limit: int) -> Optional[List[Dict[str, Any]]]:
+        """Search using the ``ddgs`` package. Returns None if not installed."""
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            logger.debug("crawl4ai: ddgs package not installed, falling back to HTML scraping")
+            return None
+
+        try:
+            web_results: List[Dict[str, Any]] = []
+            with DDGS() as client:
+                for i, hit in enumerate(client.text(query, max_results=limit)):
+                    if i >= limit:
+                        break
+                    url = str(hit.get("href") or hit.get("url") or "")
+                    web_results.append({
+                        "title": str(hit.get("title", "")),
+                        "url": url,
+                        "description": str(hit.get("body", "")),
+                        "position": i + 1,
+                    })
+            return web_results
+        except Exception as exc:
+            logger.warning("Crawl4AI ddgs search error: %s", exc)
+            # Return empty list (not None) so caller knows ddgs was tried but failed
+            return []
 
     # --- Extract ---------------------------------------------------------------
 
