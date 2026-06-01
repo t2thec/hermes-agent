@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
 
@@ -66,12 +66,14 @@ def register_provider(provider: WebSearchProvider) -> None:
     if existing is not None:
         logger.debug(
             "Web provider '%s' re-registered (was %r)",
-            name, type(existing).__name__,
+            name,
+            type(existing).__name__,
         )
     else:
         logger.debug(
             "Registered web provider '%s' (%s)",
-            name, type(provider).__name__,
+            name,
+            type(provider).__name__,
         )
 
 
@@ -119,7 +121,13 @@ def _read_config_key(*path: str) -> Optional[str]:
 # (paid providers first so existing paid setups don't get downgraded to
 # a free tier on upgrade). Filtered by ``is_available()`` at walk time so
 # we don't surface a provider the user has no credentials for.
-_LEGACY_PREFERENCE = (
+# Chain-ordered preference — try self-hosted/free first, then paid SaaS.
+# When ``web.{capability}_chain`` is configured (list of backend names),
+# the dispatcher walks that list. When no chain is configured, the
+# legacy single-provider resolution below is used.  This list also
+# serves as the legacy preference order for single-provider mode.
+_PROVIDER_PREFERENCE = (
+    "crawl4ai",      # self-hosted, free, zero-config
     "firecrawl",
     "parallel",
     "tavily",
@@ -129,8 +137,14 @@ _LEGACY_PREFERENCE = (
     "ddgs",
 )
 
+# Keep the old name as an alias so any code referencing _LEGACY_PREFERENCE
+# still works (tests, external plugins).
+_LEGACY_PREFERENCE = _PROVIDER_PREFERENCE
 
-def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearchProvider]:
+
+def _resolve(
+    configured: Optional[str], *, capability: str
+) -> Optional[WebSearchProvider]:
     """Resolve the active provider for a capability ("search" | "extract" | "crawl").
 
     Resolution rules (in order):
@@ -195,30 +209,167 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
         else:
             logger.debug(
                 "web backend '%s' configured but does not support '%s'; falling back",
-                configured, capability,
+                configured,
+                capability,
             )
 
     # 2. + 3. Fallback path — filter by availability so we don't surface
     #    a provider the user has no credentials for. Without this filter,
     #    a registered-but-unconfigured provider could end up "active" on
     #    a fresh install with no API keys at all.
-    eligible = [
-        p for p in snapshot.values()
-        if _capable(p) and _is_available_safe(p)
-    ]
+    eligible = [p for p in snapshot.values() if _capable(p) and _is_available_safe(p)]
     if len(eligible) == 1:
         return eligible[0]
 
     for legacy in _LEGACY_PREFERENCE:
         provider = snapshot.get(legacy)
-        if (
-            provider is not None
-            and _capable(provider)
-            and _is_available_safe(provider)
-        ):
+        if provider is not None and _capable(provider) and _is_available_safe(provider):
             return provider
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Provider chain execution
+# ---------------------------------------------------------------------------
+
+
+def _read_chain_config(capability: str) -> Optional[List[str]]:
+    """Read ``web.{capability}_chain`` from config.yaml.
+
+    Returns a list of backend names to try in order, or None when not
+    configured (falls back to single-provider resolution).
+    """
+    chain_key = f"{capability}_chain"
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config().get("web", {})
+        chain = cfg.get(chain_key)
+        if isinstance(chain, list) and chain:
+            return [str(n).strip().lower() for n in chain if str(n).strip()]
+    except Exception as exc:
+        logger.debug("Could not read config web.%s: %s", chain_key, exc)
+    return None
+
+
+def _is_provider_failure(result: Any) -> bool:
+    """Return True when a provider result indicates a failure worth retrying.
+
+    A result is a failure if:
+    - It's a dict with ``success: False``
+    - It's a list where ALL entries have an ``error`` key
+    - It's a dict with ``success: True`` but empty data (no search results)
+    """
+    if isinstance(result, dict):
+        if result.get("success") is False:
+            return True
+        # Search returned success but no results — treat as failure for
+        # chaining so we try the next provider
+        if result.get("success") is True:
+            data = result.get("data", {})
+            web = data.get("web", []) if isinstance(data, dict) else []
+            if not web:
+                return True
+        return False
+
+    if isinstance(result, list):
+        if not result:
+            return True
+        # All entries have errors
+        return all(isinstance(r, dict) and r.get("error") for r in result)
+
+    return True  # Unknown shape → treat as failure
+
+
+def resolve_search_chain() -> Optional[List[WebSearchProvider]]:
+    """Resolve the ordered provider chain for web search.
+
+    Uses ``web.search_chain`` if configured, otherwise builds a chain
+    from ``web.search_backend`` / ``web.backend`` + available fallbacks.
+    """
+    return _resolve_chain("search")
+
+
+def resolve_extract_chain() -> Optional[List[WebSearchProvider]]:
+    """Resolve the ordered provider chain for web extract.
+
+    Uses ``web.extract_chain`` if configured, otherwise builds a chain
+    from ``web.extract_backend`` / ``web.backend`` + available fallbacks.
+    """
+    return _resolve_chain("extract")
+
+
+def resolve_crawl_chain() -> Optional[List[WebSearchProvider]]:
+    """Resolve the ordered provider chain for web crawl.
+
+    Uses ``web.crawl_chain`` if configured, otherwise builds a chain
+    from ``web.crawl_backend`` / ``web.backend`` + available fallbacks.
+    """
+    return _resolve_chain("crawl")
+
+
+def _resolve_chain(capability: str) -> Optional[List[WebSearchProvider]]:
+    """Build the provider chain for a capability.
+
+    1. If ``web.{capability}_chain`` is configured, walk that list and
+       return only the registered+available providers.
+    2. Otherwise, put the configured primary provider first, then append
+       available fallbacks from the preference order.
+    """
+    with _lock:
+        snapshot = dict(_providers)
+
+    def _capable(p: WebSearchProvider) -> bool:
+        if capability == "search":
+            return bool(p.supports_search())
+        if capability == "extract":
+            return bool(p.supports_extract())
+        if capability == "crawl":
+            return bool(p.supports_crawl())
+        return False
+
+    def _is_available_safe(p: WebSearchProvider) -> bool:
+        try:
+            return bool(p.is_available())
+        except Exception:
+            return False
+
+    # 1. Explicit chain config
+    chain_names = _read_chain_config(capability)
+    if chain_names:
+        chain = []
+        for name in chain_names:
+            p = snapshot.get(name)
+            if p is not None and _capable(p) and _is_available_safe(p):
+                chain.append(p)
+        return chain if chain else None
+
+    # 2. Primary + fallbacks from preference order
+    explicit = _read_config_key("web", f"{capability}_backend") or _read_config_key(
+        "web", "backend"
+    )
+    primary = snapshot.get(explicit) if explicit else None
+    chain: List[WebSearchProvider] = []
+
+    # Add primary if capable+available (or if explicitly configured, add regardless
+    # so the user gets a clear error message rather than silent rerouting)
+    if primary is not None and _capable(primary):
+        chain.append(primary)
+        seen = {primary.name}
+    else:
+        seen = set()
+
+    # Add fallbacks from preference order
+    for name in _PROVIDER_PREFERENCE:
+        if name in seen:
+            continue
+        p = snapshot.get(name)
+        if p is not None and _capable(p) and _is_available_safe(p):
+            chain.append(p)
+            seen.add(name)
+
+    return chain if chain else None
 
 
 def get_active_search_provider() -> Optional[WebSearchProvider]:
@@ -227,7 +378,9 @@ def get_active_search_provider() -> Optional[WebSearchProvider]:
     Reads ``web.search_backend`` (preferred) or ``web.backend`` (shared
     fallback) from config.yaml; falls back per the module docstring.
     """
-    explicit = _read_config_key("web", "search_backend") or _read_config_key("web", "backend")
+    explicit = _read_config_key("web", "search_backend") or _read_config_key(
+        "web", "backend"
+    )
     return _resolve(explicit, capability="search")
 
 
@@ -237,7 +390,9 @@ def get_active_extract_provider() -> Optional[WebSearchProvider]:
     Reads ``web.extract_backend`` (preferred) or ``web.backend`` (shared
     fallback) from config.yaml; falls back per the module docstring.
     """
-    explicit = _read_config_key("web", "extract_backend") or _read_config_key("web", "backend")
+    explicit = _read_config_key("web", "extract_backend") or _read_config_key(
+        "web", "backend"
+    )
     return _resolve(explicit, capability="extract")
 
 
@@ -252,7 +407,9 @@ def get_active_crawl_provider() -> Optional[WebSearchProvider]:
     a different strategy (e.g. summarize-via-LLM) when neither is
     configured.
     """
-    explicit = _read_config_key("web", "crawl_backend") or _read_config_key("web", "backend")
+    explicit = _read_config_key("web", "crawl_backend") or _read_config_key(
+        "web", "backend"
+    )
     return _resolve(explicit, capability="crawl")
 
 
